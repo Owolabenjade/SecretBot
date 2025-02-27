@@ -6,7 +6,12 @@ import logging
 from datetime import datetime, timezone, timedelta
 import pytz
 import json
+import os
 from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -48,6 +53,14 @@ class BTCRsiOversoldBot:
         # Data storage
         self.price_data = pd.DataFrame()
         self.last_alert_time = None
+        
+        # Get credentials from environment variables
+        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        
+        # Check if credentials are available
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            logger.warning("Telegram credentials not found in environment variables. Notifications will not be sent.")
         
         logger.info(f"Bot initialized with: RSI Period={rsi_period}, RSI Threshold={rsi_threshold}, "
                     f"Volume Multiplier={volume_multiplier}")
@@ -275,8 +288,11 @@ Max Hold Time: 4 hours
             f.write(message)
             f.write("\n" + "="*50 + "\n")
         
-        # Send Telegram alert
-        self.send_telegram_alert(message)
+        # Send Telegram alert if credentials are available
+        if self.telegram_bot_token and self.telegram_chat_id:
+            self.send_telegram_alert(message)
+        else:
+            logger.warning("Telegram notification not sent: missing credentials")
     
     def send_telegram_alert(self, message: str) -> None:
         """
@@ -286,22 +302,16 @@ Max Hold Time: 4 hours
             message: Alert message to send
         """
         try:
-            import requests
-            
-            # Your Telegram credentials
-            BOT_TOKEN = "7931873941:AAGeGIjrieQHIuzO3uHSR6IQTqBV0Osfx20"
-            CHAT_ID = "2028552668"
-            
             # Format message for Telegram
             # Replace $ with \$ to avoid Markdown parsing issues
             formatted_message = message.replace("$", "\\$")
             
             # Telegram API endpoint for sending messages
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
             
             # Parameters for the request
             params = {
-                "chat_id": CHAT_ID,
+                "chat_id": self.telegram_chat_id,
                 "text": formatted_message,
                 "parse_mode": "MarkdownV2"  # Use Markdown formatting
             }
@@ -334,7 +344,7 @@ Max Hold Time: 4 hours
                 import urllib.parse
                 
                 text = urllib.parse.quote_plus(message)
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={text}"
+                url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage?chat_id={self.telegram_chat_id}&text={text}"
                 
                 with urllib.request.urlopen(url) as response:
                     logger.info("Telegram alert sent using fallback method")
@@ -355,12 +365,17 @@ Max Hold Time: 4 hours
         import smtplib
         from email.message import EmailMessage
         
-        # Configure these variables with your email details
-        SMTP_SERVER = "smtp.gmail.com"
-        SMTP_PORT = 587
-        EMAIL_ADDRESS = "your-email@gmail.com"
-        EMAIL_PASSWORD = "your-app-password"  # Use app password for Gmail
-        RECIPIENT_EMAIL = "your-email@gmail.com"
+        # Get email credentials from environment variables
+        SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+        EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+        EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+        RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+        
+        # Check if email credentials are available
+        if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, RECIPIENT_EMAIL]):
+            logger.warning("Email credentials not found in environment variables. Email notification not sent.")
+            return
         
         # Create and send email
         msg = EmailMessage()
