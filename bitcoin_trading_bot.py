@@ -3,11 +3,10 @@ import pandas as pd
 import numpy as np
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz
 import json
 from typing import List, Dict, Any, Optional
-import os
 
 # Configure logging
 logging.basicConfig(
@@ -53,62 +52,53 @@ class BTCRsiOversoldBot:
         logger.info(f"Bot initialized with: RSI Period={rsi_period}, RSI Threshold={rsi_threshold}, "
                     f"Volume Multiplier={volume_multiplier}")
     
-    def fetch_data_from_coingecko(self, days: int = 1) -> pd.DataFrame:
+    def fetch_binance_data(self) -> pd.DataFrame:
         """
-        Fetch Bitcoin data from CoinGecko API.
+        Fetch Bitcoin 1-minute data from Binance API.
         
-        Args:
-            days: Number of days of historical data to retrieve (default: 1)
-            
         Returns:
             DataFrame with OHLCV data
         """
         try:
-            # CoinGecko API for Bitcoin market data
-            url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            logger.info("Fetching 1-minute data from Binance API...")
+            
+            url = "https://api.binance.com/api/v3/klines"
             params = {
-                "vs_currency": "usd",
-                "days": days,
-                "interval": "minute"
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": 1000  # Last 1000 1-minute candles (maximum allowed)
             }
             
-            logger.info(f"Fetching data from CoinGecko for the past {days} day(s)...")
             response = requests.get(url, params=params)
             
             if response.status_code != 200:
-                logger.error(f"Error fetching data: {response.status_code}, {response.text}")
+                logger.error(f"Error fetching data from Binance: {response.status_code}, {response.text}")
                 return pd.DataFrame()
-            
+                
             data = response.json()
             
-            # Process price data
-            prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
-            prices["timestamp"] = pd.to_datetime(prices["timestamp"], unit="ms")
+            # Convert to DataFrame with proper column names
+            # Binance klines format: [Open time, Open, High, Low, Close, Volume, Close time, Quote asset volume, 
+            #                         Number of trades, Taker buy base asset volume, Taker buy quote asset volume, Ignore]
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
             
-            # Process volume data
-            volumes = pd.DataFrame(data["total_volumes"], columns=["timestamp", "volume"])
-            volumes["timestamp"] = pd.to_datetime(volumes["timestamp"], unit="ms")
+            # Convert types
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+                
+            # Keep only the columns we need
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             
-            # Merge price and volume data
-            merged_data = pd.merge_asof(prices, volumes, on="timestamp")
+            logger.info(f"Successfully fetched {len(df)} data points from Binance")
+            return df
             
-            # Create OHLCV data (CoinGecko only provides close prices and volumes)
-            # We'll use the close price for open, high, and low for the current minute
-            # For a production system, you'd need a more granular data source
-            merged_data["open"] = merged_data["price"].shift(1)
-            merged_data["high"] = merged_data["price"]
-            merged_data["low"] = merged_data["price"]
-            merged_data["close"] = merged_data["price"]
-            
-            # Drop the first row (has NaN in open) and the price column (redundant)
-            merged_data = merged_data.dropna()
-            merged_data = merged_data.drop(columns=["price"])
-            
-            logger.info(f"Successfully fetched {len(merged_data)} data points")
-            return merged_data
-        
         except Exception as e:
-            logger.error(f"Error fetching data from CoinGecko: {str(e)}")
+            logger.error(f"Error fetching data from Binance: {str(e)}")
             return pd.DataFrame()
     
     def calculate_rsi(self, data: pd.DataFrame, column: str = "close") -> np.ndarray:
@@ -208,6 +198,14 @@ class BTCRsiOversoldBot:
             data.loc[latest_idx, "relative_volume"] > self.volume_multiplier
         )
         
+        # Print current values for debugging
+        current_price = data.loc[latest_idx, "close"]
+        current_rsi = data.loc[latest_idx, "rsi"]
+        current_vol = data.loc[latest_idx, "relative_volume"] if not np.isnan(data.loc[latest_idx, "relative_volume"]) else None
+        
+        logger.info(f"Current Price: ${current_price:.2f}, RSI: {current_rsi:.2f}, " + 
+                    f"Relative Volume: {current_vol:.2f}x" if current_vol else "N/A")
+        
         # Check if all conditions are met
         if is_oversold and is_rsi_turning_up and is_bullish and is_high_volume:
             return {
@@ -258,7 +256,6 @@ Max Hold Time: 4 hours
     def send_alert(self, message: str) -> None:
         """
         Send an alert with the given message.
-        This is a placeholder - implement your preferred alert method here.
         
         Args:
             message: Alert message to send
@@ -272,19 +269,77 @@ Max Hold Time: 4 hours
         # Record the alert time
         self.last_alert_time = datetime.now()
         
-        # === ALERT IMPLEMENTATION OPTIONS ===
-        
-        # Option 1: Write to a file
+        # Write to a file
         with open("btc_trading_signals.txt", "a") as f:
             f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(message)
             f.write("\n" + "="*50 + "\n")
         
-        # Option 2: Send an email (uncomment and configure)
-        # self.send_email_alert(message)
+        # Send Telegram alert
+        self.send_telegram_alert(message)
+    
+    def send_telegram_alert(self, message: str) -> None:
+        """
+        Send a Telegram alert with the given message.
         
-        # Option 3: Send a Telegram message (uncomment and configure)
-        # self.send_telegram_alert(message)
+        Args:
+            message: Alert message to send
+        """
+        try:
+            import requests
+            
+            # Your Telegram credentials
+            BOT_TOKEN = "7931873941:AAGeGIjrieQHIuzO3uHSR6IQTqBV0Osfx20"
+            CHAT_ID = "2028552668"
+            
+            # Format message for Telegram
+            # Replace $ with \$ to avoid Markdown parsing issues
+            formatted_message = message.replace("$", "\\$")
+            
+            # Telegram API endpoint for sending messages
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            
+            # Parameters for the request
+            params = {
+                "chat_id": CHAT_ID,
+                "text": formatted_message,
+                "parse_mode": "MarkdownV2"  # Use Markdown formatting
+            }
+            
+            # Send the message
+            response = requests.post(url, params=params)
+            
+            # Check if the message was sent successfully
+            if response.status_code == 200:
+                logger.info("Telegram alert sent successfully")
+            else:
+                logger.error(f"Failed to send Telegram alert: {response.status_code}, {response.text}")
+                
+                # Try again without Markdown if there was an error
+                params["parse_mode"] = ""
+                params["text"] = message  # Use original message
+                response = requests.post(url, params=params)
+                
+                if response.status_code == 200:
+                    logger.info("Telegram alert sent successfully (without formatting)")
+                else:
+                    logger.error(f"Second attempt failed: {response.status_code}, {response.text}")
+        
+        except Exception as e:
+            logger.error(f"Failed to send Telegram alert: {str(e)}")
+            
+            # Try an alternative method if the import fails
+            try:
+                import urllib.request
+                import urllib.parse
+                
+                text = urllib.parse.quote_plus(message)
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={text}"
+                
+                with urllib.request.urlopen(url) as response:
+                    logger.info("Telegram alert sent using fallback method")
+            except Exception as e2:
+                logger.error(f"Fallback method also failed: {str(e2)}")
     
     def send_email_alert(self, message: str) -> None:
         """
@@ -294,8 +349,8 @@ Max Hold Time: 4 hours
         Args:
             message: Alert message to send
         """
-        # Implement email sending logic here
-        # Example using smtplib (you'd need to import it)
+        # Implement email sending logic
+        # Example using smtplib:
         '''
         import smtplib
         from email.message import EmailMessage
@@ -305,7 +360,7 @@ Max Hold Time: 4 hours
         SMTP_PORT = 587
         EMAIL_ADDRESS = "your-email@gmail.com"
         EMAIL_PASSWORD = "your-app-password"  # Use app password for Gmail
-        RECIPIENT_EMAIL = "recipient-email@example.com"
+        RECIPIENT_EMAIL = "your-email@gmail.com"
         
         # Create and send email
         msg = EmailMessage()
@@ -326,51 +381,29 @@ Max Hold Time: 4 hours
         '''
         pass
     
-    def send_telegram_alert(self, message: str) -> None:
-        """
-        Send a Telegram alert with the given message.
-        Requires Telegram bot configuration.
-        
-        Args:
-            message: Alert message to send
-        """
-        # Implement Telegram sending logic here
-        # Example using python-telegram-bot (you'd need to install it)
-        '''
-        import telegram
-        
-        # Configure these variables with your Telegram details
-        BOT_TOKEN = "your-bot-token"
-        CHAT_ID = "your-chat-id"
-        
-        try:
-            bot = telegram.Bot(token=BOT_TOKEN)
-            bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-            logger.info("Telegram alert sent successfully")
-        except Exception as e:
-            logger.error(f"Failed to send Telegram alert: {str(e)}")
-        '''
-        pass
-    
     def run(self) -> None:
         """
         Run the bot continuously, checking for trading signals.
         """
-        logger.info("Starting Bitcoin RSI Oversold Bounce Trading Bot...")
+        logger.info("Starting Bitcoin RSI Oversold Bounce Trading Bot with Binance API...")
         logger.info(f"Optimal trading hours (UTC): {self.optimal_hours}")
         
         while True:
             try:
-                # Fetch latest data
-                self.price_data = self.fetch_data_from_coingecko()
+                # Fetch latest data from Binance
+                self.price_data = self.fetch_binance_data()
                 
                 if self.price_data.empty:
-                    logger.warning("No data received, retrying in 60 seconds...")
+                    logger.warning("No data received from Binance, retrying in 60 seconds...")
                     time.sleep(60)
                     continue
                 
                 # Check if we're in an optimal trading hour
                 is_optimal_hour = self.is_optimal_trading_hour()
+                current_hour = datetime.now(timezone.utc).hour
+                
+                if is_optimal_hour:
+                    logger.info(f"Current hour ({current_hour} UTC) is an optimal trading window.")
                 
                 # Only proceed with signal checks during optimal hours if enabled
                 if not self.prioritize_time_windows or is_optimal_hour:
@@ -385,12 +418,6 @@ Max Hold Time: 4 hours
                             alert_message = self.format_alert_message(signal)
                             self.send_alert(alert_message)
                 
-                # Log current status
-                current_time = datetime.now()
-                current_hour = current_time.hour
-                if is_optimal_hour:
-                    logger.info(f"Current hour ({current_hour}) is an optimal trading window.")
-                
                 # Sleep before next check
                 logger.info(f"Waiting {self.check_interval} seconds until next check...")
                 time.sleep(self.check_interval)
@@ -400,13 +427,13 @@ Max Hold Time: 4 hours
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {str(e)}")
-                logger.info("Waiting 120 seconds before retry...")
-                time.sleep(120)
+                logger.info("Waiting 60 seconds before retry...")
+                time.sleep(60)
 
-# Example configuration - customize these parameters based on your preferences
+# Configuration
 bot_config = {
     "rsi_period": 14,
-    "rsi_threshold": 30.0,
+    "rsi_threshold": 30.0,  # Consider lowering to 25 for stronger signals
     "volume_multiplier": 1.2,
     "check_interval": 60,  # Check every minute
     "optimal_hours": [1, 7, 5, 16, 13],  # Best trading hours from our analysis
